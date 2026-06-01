@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-인테리어 마켓 아침 브리핑 → 카카오톡 '나에게 보내기' 자동 발송
+아침 마켓 브리핑 → 카카오톡 '나에게 보내기' 자동 발송
 ------------------------------------------------------------------
-동작 순서:
-  1) refresh_token 으로 access_token 자동 갱신
-  2) Google 뉴스 RSS 에서 키워드별 최신 기사 수집
-  3) 브리핑 텍스트 조립
-  4) 카카오 '나에게 보내기'(메모) API 로 본인 카톡에 전송
+구성(섹션별로 여러 건 나눠 발송 — 카톡 텍스트 1건 200자 제한 대응):
+  1) 📊 지수·환율 (코스피/코스닥/환율/다우/나스닥/S&P500)
+  2) 🏢 인테리어 관련주 (한샘/LX하우시스/KCC/현대리바트)
+  3) 🏠 인테리어 시장 뉴스
+  4) 🏗 부동산·건설·정책 뉴스
+  5) 💰 경제·금융 뉴스
+  6) 📰 종합 헤드라인
+  7) 🧰 소상공인 이슈
 
-사전 준비 (자세한 건 셋업 가이드 참고):
-  - 카카오 개발자 앱 생성 → REST API 키 발급
-  - 카카오 로그인 동의항목에 'talk_message' 추가
-  - 최초 1회 OAuth 로 refresh_token 발급 후 아래 .env 에 저장
+동작:
+  - refresh_token 으로 access_token 자동 갱신
+  - 주가/지수: Yahoo Finance 공개 차트 API
+  - 뉴스: Google 뉴스 RSS
+  - 카카오 '나에게 보내기'(메모) API 로 본인 카톡에 섹션별 전송
 
 필요 패키지:  pip install requests feedparser python-dotenv
 """
 
 import os
+import time
+import json
 import datetime
 import urllib.parse
 import requests
@@ -28,20 +34,35 @@ load_dotenv()
 
 REST_API_KEY  = os.getenv("KAKAO_REST_API_KEY")
 REFRESH_TOKEN = os.getenv("KAKAO_REFRESH_TOKEN")
-CLIENT_SECRET = os.getenv("KAKAO_CLIENT_SECRET")  # 클라이언트 시크릿 활성화 시 필요
+CLIENT_SECRET = os.getenv("KAKAO_CLIENT_SECRET")
 
-# 영역별 검색 키워드 (Google 뉴스 RSS, 한국어/한국 지역)
-TOPICS = {
-    "🏠 국내 인테리어 시장": "인테리어 리모델링 시장 OR 한샘 OR LX하우시스",
-    "🏗 부동산·건설 연계":   "리모델링 수요 OR 주택 거래량 OR 건설경기",
-    "🌍 해외 트렌드":        "interior design trend 2026",
-    "🧪 소재·기술·신제품":   "인테리어 친환경 자재 OR 스마트홈 신제품",
-}
+TEXT_LIMIT = 190          # 카톡 텍스트 템플릿 안전 한도
 ARTICLES_PER_TOPIC = 3
+TITLE_MAX = 45            # 기사 제목 표시 길이
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+# ── 지수·환율 / 종목 (Yahoo Finance 심볼) ───────────────────────────
+INDICES = {
+    "코스피": "^KS11", "코스닥": "^KQ11", "원/달러": "KRW=X",
+    "다우": "^DJI", "나스닥": "^IXIC", "S&P500": "^GSPC",
+}
+INTERIOR_STOCKS = {
+    "한샘": "009240.KS", "LX하우시스": "108670.KS",
+    "KCC": "002380.KS", "현대리바트": "079430.KS",
+}
+
+# ── 뉴스 섹션 (Google 뉴스 RSS 검색어) ──────────────────────────────
+NEWS_SECTIONS = {
+    "🏠 인테리어 시장": "인테리어 리모델링 시장 OR 한샘 OR LX하우시스",
+    "🏗 부동산·건설·정책": "부동산 정책 OR 주택 거래량 OR 재건축 OR 건설경기",
+    "💰 경제·금융": "금리 OR 환율 OR 한국경제 OR 코스피 전망",
+    "🧰 소상공인": "소상공인 OR 자영업 지원 OR 최저임금 OR 인건비",
+}
+HEADLINE_RSS = "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"  # 종합 헤드라인
 
 
+# ── 카카오 토큰 ────────────────────────────────────────────────────
 def refresh_access_token() -> str:
-    """refresh_token 으로 access_token 갱신."""
     payload = {
         "grant_type": "refresh_token",
         "client_id": REST_API_KEY,
@@ -49,21 +70,16 @@ def refresh_access_token() -> str:
     }
     if CLIENT_SECRET:
         payload["client_secret"] = CLIENT_SECRET
-    resp = requests.post(
-        "https://kauth.kakao.com/oauth/token",
-        data=payload,
-        timeout=10,
-    )
+    resp = requests.post("https://kauth.kakao.com/oauth/token",
+                         data=payload, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    # refresh_token 이 함께 갱신되면 .env 에 새로 저장해 두는 것이 안전
     if "refresh_token" in data:
         _update_env("KAKAO_REFRESH_TOKEN", data["refresh_token"])
     return data["access_token"]
 
 
 def _update_env(key: str, value: str):
-    """.env 파일의 키 값을 갱신 (refresh_token 회전 대비)."""
     path = ".env"
     lines, found = [], False
     if os.path.exists(path):
@@ -71,60 +87,101 @@ def _update_env(key: str, value: str):
             lines = f.readlines()
     for i, line in enumerate(lines):
         if line.startswith(key + "="):
-            lines[i] = f"{key}={value}\n"
-            found = True
+            lines[i] = f"{key}={value}\n"; found = True
     if not found:
         lines.append(f"{key}={value}\n")
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
 
-def fetch_news() -> str:
-    """키워드별 RSS 수집 → 브리핑 본문 조립."""
-    today = datetime.date.today().strftime("%Y.%m.%d (%a)")
-    parts = [f"🗞 인테리어 마켓 브리핑 — {today}\n"]
-    for title, query in TOPICS.items():
+# ── 시세 조회 ──────────────────────────────────────────────────────
+def quote(symbol: str):
+    """Yahoo 차트 API로 현재가/전일대비% 반환. 실패 시 None."""
+    try:
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+               f"{urllib.parse.quote(symbol)}?interval=1d&range=2d")
+        r = requests.get(url, headers=UA, timeout=10)
+        m = r.json()["chart"]["result"][0]["meta"]
+        price = m.get("regularMarketPrice")
+        prev = m.get("chartPreviousClose") or m.get("previousClose")
+        if price is None or not prev:
+            return None
+        pct = (price - prev) / prev * 100
+        return price, pct
+    except Exception:
+        return None
+
+
+def fmt_quote(name, q):
+    if q is None:
+        return f"{name} n/a"
+    price, pct = q
+    p = f"{price:,.0f}" if price >= 100 else f"{price:,.1f}"
+    sign = "▲" if pct > 0 else ("▼" if pct < 0 else "-")
+    return f"{name} {p} {sign}{abs(pct):.1f}%"
+
+
+def build_market_blocks():
+    idx = " / ".join(fmt_quote(n, quote(s)) for n, s in INDICES.items())
+    stk = " / ".join(fmt_quote(n, quote(s)) for n, s in INTERIOR_STOCKS.items())
+    return ["📊 지수·환율\n" + idx, "🏢 인테리어 관련주\n" + stk]
+
+
+# ── 뉴스 조회 ──────────────────────────────────────────────────────
+def news_block(header: str, rss_url: str):
+    feed = feedparser.parse(rss_url)
+    lines = [header]
+    for e in feed.entries[:ARTICLES_PER_TOPIC]:
+        t = e.title.split(" - ")[0][:TITLE_MAX]
+        lines.append(f"• {t}")
+    if len(lines) == 1:
+        lines.append("• (관련 기사 없음)")
+    return "\n".join(lines)
+
+
+def build_news_blocks():
+    blocks = []
+    for header, query in NEWS_SECTIONS.items():
         q = urllib.parse.quote(query)
         url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
-        feed = feedparser.parse(url)
-        parts.append(f"\n{title}")
-        if not feed.entries:
-            parts.append(" • (관련 기사 없음)")
-            continue
-        for entry in feed.entries[:ARTICLES_PER_TOPIC]:
-            parts.append(f" • {entry.title}\n   {entry.link}")
-    return "\n".join(parts)
+        blocks.append(news_block(header, url))
+    blocks.append(news_block("📰 종합 헤드라인", HEADLINE_RSS))
+    return blocks
 
 
-def send_to_kakao(text: str, access_token: str):
-    """카카오 '나에게 보내기'(메모) API. 텍스트 템플릿은 최대 200자 본문 권장,
-    길면 카카오가 자르므로 여기서는 텍스트+더보기 링크 구조로 전송."""
-    # 카톡 텍스트 메시지 본문은 최대 200자. 초과분은 잘리므로 핵심 요약만 담고
-    # 전체는 link 로 연결하는 것이 이상적. MVP 에서는 앞부분만 전송.
+# ── 발송 ───────────────────────────────────────────────────────────
+def send_memo(text: str, token: str):
     template = {
         "object_type": "text",
-        "text": text[:1000],   # 카카오 text 템플릿 한도(약 1,000자) 내로 제한
+        "text": text[:TEXT_LIMIT],
         "link": {"web_url": "https://news.google.com/",
                  "mobile_web_url": "https://news.google.com/"},
         "button_title": "뉴스 더보기",
     }
-    resp = requests.post(
+    r = requests.post(
         "https://kapi.kakao.com/v2/api/talk/memo/default/send",
-        headers={"Authorization": f"Bearer {access_token}"},
-        data={"template_object": __import__("json").dumps(template)},
+        headers={"Authorization": f"Bearer {token}"},
+        data={"template_object": json.dumps(template)},
         timeout=10,
     )
-    resp.raise_for_status()
-    print("✅ 카카오 발송 완료:", resp.json())
+    r.raise_for_status()
+    return r.json()
 
 
 def main():
     if not REST_API_KEY or not REFRESH_TOKEN:
-        raise SystemExit("⚠️  .env 에 KAKAO_REST_API_KEY / KAKAO_REFRESH_TOKEN 를 먼저 설정하세요.")
+        raise SystemExit("⚠️  .env 에 KAKAO 키/토큰을 먼저 설정하세요.")
     token = refresh_access_token()
-    briefing = fetch_news()
-    print(briefing)            # 콘솔에도 출력 (디버깅용)
-    send_to_kakao(briefing, token)
+
+    today = datetime.date.today().strftime("%Y.%m.%d (%a)")
+    blocks = [f"🗞 오늘의 마켓 브리핑 — {today}"]
+    blocks += build_market_blocks()
+    blocks += build_news_blocks()
+
+    for i, b in enumerate(blocks, 1):
+        res = send_memo(b, token)
+        print(f"[{i}/{len(blocks)}] sent:", res)
+        time.sleep(0.6)   # 연속 발송 간 간격
 
 
 if __name__ == "__main__":
